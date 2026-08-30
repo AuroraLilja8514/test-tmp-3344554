@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main, phase0-timezone-probe]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-probe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path '.\probe\launch-codex.ps1'),
+            [ref]$null,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python inspector
+        run: python -m py_compile probe/inspect-timezone.py
+
+      - name: Install probe dependency
+        run: python -m pip install -r requirements-probe.txt
+
+      - name: Check inspector CLI
+        run: python probe/inspect-timezone.py --help
