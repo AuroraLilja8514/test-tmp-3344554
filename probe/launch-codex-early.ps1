@@ -75,13 +75,12 @@ function Start-CodexPausedForBootstrap {
     $psi.WorkingDirectory = Split-Path -Parent $ExecutablePath
     $psi.UseShellExecute = $false
 
-    # Keep TZ as a child-only hint for Node/CLI subprocesses. The first probe
-    # proved that Chromium on Windows ignores it, so the renderer override is
-    # installed separately by bootstrap-electron-timezone.py.
+    # Keep TZ as a child-only hint for Node/CLI subprocesses. Chromium on
+    # Windows ignores it, so the renderer override is installed separately.
     $psi.EnvironmentVariables["TZ"] = $RequestedTimeZone
     $psi.EnvironmentVariables["CODEX_TZ_LAUNCHER_REQUESTED"] = $RequestedTimeZone
 
-    # Electron documents --inspect-brk for the main process. Binding explicitly
+    # Electron documents --inspect-brk for its main process. Binding explicitly
     # to loopback prevents the inspector from being exposed on the network.
     $psi.Arguments = "--inspect-brk=127.0.0.1:$Port"
 
@@ -139,7 +138,7 @@ try {
     Write-Host "Bootstrap/renderer wait budget: $TimeoutSeconds seconds"
     Write-Host "Note: --inspect-brk intentionally prevents the Codex window from appearing until the helper installs the hook and resumes startup."
 
-    $bootstrap = Join-Path $PSScriptRoot "bootstrap-electron-timezone.py"
+    $bootstrap = Join-Path $PSScriptRoot "bootstrap-electron-timezone-callframe.py"
     if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf)) {
         Write-Warning "Bootstrap script is missing: $bootstrap"
         Write-Warning "Codex may remain paused because --inspect-brk was requested. Close it manually if necessary."
