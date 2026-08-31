@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -59,7 +60,7 @@ std::string WideToAnsi(const std::wstring& value) {
 
 void PrintUsage() {
     std::wcerr << L"Usage: tzshim-launcher.exe --timezone-windows-id <Windows ID> "
-                  L"[--log <path>] -- <exe> [args...]\n";
+                  L"[--log <path>] [--wait] -- <exe> [args...]\n";
 }
 
 }  // namespace
@@ -67,6 +68,7 @@ void PrintUsage() {
 int wmain(int argc, wchar_t** argv) {
     std::wstring windows_id;
     std::wstring log_path;
+    bool wait_for_exit = false;
     int separator = -1;
 
     for (int i = 1; i < argc; ++i) {
@@ -81,6 +83,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (arg == L"--log" && i + 1 < argc) {
             log_path = argv[++i];
+            continue;
+        }
+        if (arg == L"--wait") {
+            wait_for_exit = true;
             continue;
         }
         PrintUsage();
@@ -147,6 +153,17 @@ int wmain(int argc, wchar_t** argv) {
     std::wcout << L"Started PID " << process.dwProcessId << L" with process-local Windows timezone ID '"
                << windows_id << L"'.\n";
     CloseHandle(process.hThread);
+
+    int exit_code = 0;
+    if (wait_for_exit) {
+        WaitForSingleObject(process.hProcess, INFINITE);
+        DWORD child_exit = 0;
+        if (!GetExitCodeProcess(process.hProcess, &child_exit)) {
+            exit_code = 5;
+        } else {
+            exit_code = static_cast<int>(child_exit);
+        }
+    }
     CloseHandle(process.hProcess);
-    return 0;
+    return exit_code;
 }
