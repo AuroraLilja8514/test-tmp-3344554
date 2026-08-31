@@ -9,8 +9,8 @@ param(
 
     [string]$Python = "python",
 
-    [ValidateRange(5, 120)]
-    [int]$TimeoutSeconds = 25
+    [ValidateRange(5, 300)]
+    [int]$TimeoutSeconds = 60
 )
 
 Set-StrictMode -Version Latest
@@ -136,6 +136,8 @@ try {
     Write-Host "Started Codex PID $($process.Id)." -ForegroundColor Green
     Write-Host "Parent PowerShell environment remained unchanged."
     Write-Host "Electron main inspector (loopback only): $InspectorPort"
+    Write-Host "Bootstrap/renderer wait budget: $TimeoutSeconds seconds"
+    Write-Host "Note: --inspect-brk intentionally prevents the Codex window from appearing until the helper installs the hook and resumes startup."
 
     $bootstrap = Join-Path $PSScriptRoot "bootstrap-electron-timezone.py"
     if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf)) {
