@@ -1,0 +1,3 @@
+LIBRARY "CodexTzShim"
+EXPORTS
+    DetourFinishHelperProcess @1
