@@ -54,3 +54,5 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python probe/bootstrap-electron-timezone.py --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python probe/bootstrap-electron-timezone-callframe.py --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
