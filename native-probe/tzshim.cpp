@@ -114,6 +114,54 @@ void AppendLog(const std::wstring& message) {
     CloseHandle(file);
 }
 
+template <typename T>
+T ResolveExport(const wchar_t* module_name, const char* proc_name, T fallback) {
+    HMODULE module = GetModuleHandleW(module_name);
+    if (module == nullptr) {
+        module = LoadLibraryW(module_name);
+    }
+    if (module == nullptr) return fallback;
+
+    FARPROC proc = GetProcAddress(module, proc_name);
+    if (proc == nullptr) return fallback;
+    return reinterpret_cast<T>(proc);
+}
+
+void ResolveHookTargets() {
+    // Modern desktop imports for these APIs commonly arrive through API-set
+    // forwarders and converge on KernelBase.dll. Detouring the public import
+    // thunk can therefore miss callers in other modules. Patch the concrete
+    // KernelBase implementations instead, while retaining the public address as
+    // a fallback for Windows builds where a particular export is absent.
+    RealGetDynamicTimeZoneInformation = ResolveExport(
+        L"KernelBase.dll", "GetDynamicTimeZoneInformation", RealGetDynamicTimeZoneInformation);
+    RealGetTimeZoneInformation = ResolveExport(
+        L"KernelBase.dll", "GetTimeZoneInformation", RealGetTimeZoneInformation);
+    RealGetTimeZoneInformationForYear = ResolveExport(
+        L"KernelBase.dll", "GetTimeZoneInformationForYear", RealGetTimeZoneInformationForYear);
+    RealGetLocalTime = ResolveExport(L"KernelBase.dll", "GetLocalTime", RealGetLocalTime);
+    RealSystemTimeToTzSpecificLocalTimeEx = ResolveExport(
+        L"KernelBase.dll",
+        "SystemTimeToTzSpecificLocalTimeEx",
+        RealSystemTimeToTzSpecificLocalTimeEx);
+    RealTzSpecificLocalTimeToSystemTimeEx = ResolveExport(
+        L"KernelBase.dll",
+        "TzSpecificLocalTimeToSystemTimeEx",
+        RealTzSpecificLocalTimeToSystemTimeEx);
+    RealSystemTimeToTzSpecificLocalTime = ResolveExport(
+        L"KernelBase.dll",
+        "SystemTimeToTzSpecificLocalTime",
+        RealSystemTimeToTzSpecificLocalTime);
+    RealTzSpecificLocalTimeToSystemTime = ResolveExport(
+        L"KernelBase.dll",
+        "TzSpecificLocalTimeToSystemTime",
+        RealTzSpecificLocalTimeToSystemTime);
+    RealCreateProcessW =
+        ResolveExport(L"KernelBase.dll", "CreateProcessW", RealCreateProcessW);
+    RealCreateProcessA =
+        ResolveExport(L"KernelBase.dll", "CreateProcessA", RealCreateProcessA);
+}
+
 bool LoadTargetZone() {
     const std::wstring requested = GetEnvironmentString(L"CODEX_TZ_WINDOWS_ID");
     if (requested.empty()) return false;
@@ -365,6 +413,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DetourRestoreAfterWith();
         DisableThreadLibraryCalls(instance);
+        ResolveHookTargets();
 
         wchar_t dll_path[MAX_PATH * 4]{};
         if (GetModuleFileNameW(instance, dll_path, static_cast<DWORD>(std::size(dll_path))) != 0) {
