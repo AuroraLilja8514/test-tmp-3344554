@@ -63,6 +63,76 @@ function Get-RunningCodexProcesses {
     return $matches
 }
 
+function Resolve-PythonExecutable {
+    param([Parameter(Mandatory = $true)][string]$PythonCommand)
+
+    if (Test-Path -LiteralPath $PythonCommand -PathType Leaf) {
+        return [System.IO.Path]::GetFullPath($PythonCommand)
+    }
+
+    $resolved = Get-Command -Name $PythonCommand -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($null -eq $resolved) {
+        throw "Python executable was not found: $PythonCommand"
+    }
+    return $resolved.Source
+}
+
+function Test-BootstrapPrerequisites {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonExecutable,
+        [Parameter(Mandatory = $true)][string]$BootstrapPath
+    )
+
+    if (-not (Test-Path -LiteralPath $BootstrapPath -PathType Leaf)) {
+        throw "Bootstrap script is missing: $BootstrapPath"
+    }
+
+    $checkScript = @'
+import pathlib
+import sys
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        f"Python 3.10 or newer is required; found {sys.version.split()[0]} at {sys.executable}"
+    )
+
+try:
+    import websocket
+except Exception as exc:
+    raise SystemExit(
+        "Python package 'websocket-client' is required. "
+        f"Install it with: {sys.executable} -m pip install websocket-client\n"
+        f"Import error: {exc}"
+    )
+
+if not callable(getattr(websocket, "create_connection", None)):
+    raise SystemExit(
+        "The imported 'websocket' module is not websocket-client (create_connection is missing). "
+        f"Install the correct package with: {sys.executable} -m pip install websocket-client"
+    )
+
+bootstrap = pathlib.Path(sys.argv[1])
+source = bootstrap.read_text(encoding="utf-8")
+compile(source, str(bootstrap), "exec")
+
+version = getattr(websocket, "__version__", "unknown")
+print(f"Python       : {sys.executable}")
+print(f"Python ver.  : {sys.version.split()[0]}")
+print(f"websocket-client: {version}")
+print(f"Bootstrap    : {bootstrap}")
+'@
+
+    $preflightOutput = @(& $PythonExecutable -c $checkScript $BootstrapPath 2>&1)
+    $preflightExitCode = $LASTEXITCODE
+    foreach ($line in $preflightOutput) {
+        Write-Host $line
+    }
+    if ($preflightExitCode -ne 0) {
+        throw "Python/bootstrap prerequisite check failed (exit code $preflightExitCode). Codex was not started."
+    }
+}
+
 function Start-CodexPausedForBootstrap {
     param(
         [Parameter(Mandatory = $true)][string]$ExecutablePath,
@@ -109,6 +179,17 @@ try {
         exit 2
     }
 
+    # All prerequisites that could otherwise strand Codex at --inspect-brk are
+    # checked BEFORE creating the Codex process. A wrong Python path, missing
+    # websocket-client package, unsupported Python version, missing helper, or
+    # helper syntax error now fails safely without launching Codex at all.
+    $bootstrap = Join-Path $PSScriptRoot "bootstrap-electron-timezone-callframe.py"
+    Write-Host ""
+    Write-Host "Checking bootstrap prerequisites before Codex launch..." -ForegroundColor Cyan
+    $pythonExecutable = Resolve-PythonExecutable -PythonCommand $Python
+    Test-BootstrapPrerequisites -PythonExecutable $pythonExecutable -BootstrapPath $bootstrap
+    Write-Host "Prerequisite check passed. Codex has not been started yet." -ForegroundColor Green
+
     $parentTzBefore = [System.Environment]::GetEnvironmentVariable("TZ", "Process")
     $parentMarkerBefore = [System.Environment]::GetEnvironmentVariable("CODEX_TZ_LAUNCHER_REQUESTED", "Process")
 
@@ -138,16 +219,9 @@ try {
     Write-Host "Bootstrap/renderer wait budget: $TimeoutSeconds seconds"
     Write-Host "Note: --inspect-brk intentionally prevents the Codex window from appearing until the helper installs the hook and resumes startup."
 
-    $bootstrap = Join-Path $PSScriptRoot "bootstrap-electron-timezone-callframe.py"
-    if (-not (Test-Path -LiteralPath $bootstrap -PathType Leaf)) {
-        Write-Warning "Bootstrap script is missing: $bootstrap"
-        Write-Warning "Codex may remain paused because --inspect-brk was requested. Close it manually if necessary."
-        exit 3
-    }
-
     Write-Host ""
     Write-Host "Installing early renderer timezone override..."
-    & $Python $bootstrap --port $InspectorPort --requested $TimeZone --timeout $TimeoutSeconds
+    & $pythonExecutable $bootstrap --port $InspectorPort --requested $TimeZone --timeout $TimeoutSeconds
     $bootstrapExitCode = $LASTEXITCODE
 
     switch ($bootstrapExitCode) {
