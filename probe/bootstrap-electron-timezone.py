@@ -3,9 +3,13 @@
 
 The target application is launched with Electron/Node's --inspect-brk switch so
 its main JavaScript is paused before normal application code runs. This helper
-attaches to that localhost inspector, installs an Electron `web-contents-created`
-listener, and uses each WebContents' documented debugger API to send Chromium's
-`Emulation.setTimezoneOverride` command.
+attaches to that localhost inspector, releases Node's initial "waiting for
+debugger" gate, waits for the --inspect-brk entry pause, installs an Electron
+`web-contents-created` listener while JavaScript is still paused, and then
+resumes the application.
+
+Each WebContents receives Chromium's documented `Emulation.setTimezoneOverride`
+command through Electron's `webContents.debugger` API.
 
 No application files are modified. No Windows timezone setting is changed. The
 listener and debugger attachments live only inside the launched Electron
@@ -20,7 +24,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 try:
     import websocket  # type: ignore
@@ -60,6 +64,7 @@ def wait_for_inspector_target(port: int, timeout: float) -> dict:
 class InspectorClient:
     ws: object
     next_id: int = 1
+    events: list[dict] = field(default_factory=list)
 
     @classmethod
     def connect(cls, ws_url: str, timeout: float = 5.0) -> "InspectorClient":
@@ -76,6 +81,33 @@ class InspectorClient:
         except Exception:
             pass
 
+    def _remember_event(self, message: dict) -> None:
+        self.events.append(message)
+        if len(self.events) > 200:
+            del self.events[: len(self.events) - 200]
+
+    def _recv_message(self, deadline: float) -> dict | None:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                # websocket-client applies this timeout to each recv(). Keep it
+                # short and retry so one quiet interval does not become a false
+                # terminal "Connection timed out" result.
+                self.ws.settimeout(min(1.0, max(0.1, remaining)))
+                raw = self.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+
+            if raw is None or raw == "":
+                raise RuntimeError("Electron inspector connection closed")
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(message, dict):
+                return message
+        return None
+
     def command(self, method: str, params: dict | None = None, timeout: float = 8.0) -> dict:
         request_id = self.next_id
         self.next_id += 1
@@ -86,14 +118,31 @@ class InspectorClient:
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            raw = self.ws.recv()
-            message = json.loads(raw)
+            message = self._recv_message(deadline)
+            if message is None:
+                break
             if message.get("id") != request_id:
+                self._remember_event(message)
                 continue
             if "error" in message:
                 raise RuntimeError(f"{method} failed: {message['error']}")
             return message.get("result", {})
         raise RuntimeError(f"Timed out waiting for {method}")
+
+    def wait_for_event(self, method: str, timeout: float = 10.0) -> dict:
+        for index, message in enumerate(self.events):
+            if message.get("method") == method:
+                return self.events.pop(index)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = self._recv_message(deadline)
+            if message is None:
+                break
+            if message.get("method") == method:
+                return message
+            self._remember_event(message)
+        raise RuntimeError(f"Timed out waiting for inspector event {method}")
 
     def evaluate(self, expression: str, *, await_promise: bool = True, timeout: float = 10.0):
         result = self.command(
@@ -162,7 +211,7 @@ def make_bootstrap_expression(requested: str) -> str:
     }}
   }};
 
-  const applyWithRetry = (wc, remaining = 30) => {{
+  const applyWithRetry = (wc, remaining = 60) => {{
     if (!wc || wc.isDestroyed() || remaining <= 0) return;
     Promise.resolve(apply(wc)).then((ok) => {{
       if (!ok && !wc.isDestroyed()) {{
@@ -215,8 +264,8 @@ def normalize_zone(value: str) -> str:
 
 
 def resume_application(client: InspectorClient) -> None:
-    # Depending on the Electron/Node version, --inspect-brk may be represented as
-    # "waiting for debugger" or as an ordinary debugger pause. Try both forms.
+    # This function is deliberately idempotent-ish and is also used from the
+    # failure path. Never leave Codex suspended merely because the probe failed.
     try:
         client.command("Runtime.runIfWaitingForDebugger", timeout=3.0)
     except Exception:
@@ -227,40 +276,60 @@ def resume_application(client: InspectorClient) -> None:
         pass
 
 
+def enter_inspect_brk_pause(client: InspectorClient, timeout: float) -> dict:
+    """Move Node from inspector-waiting state to the --inspect-brk entry pause."""
+    try:
+        client.command("Runtime.enable", timeout=5.0)
+    except Exception:
+        pass
+    try:
+        client.command("Debugger.enable", timeout=5.0)
+    except Exception:
+        pass
+
+    # With --inspect-brk, Node initially waits for this command before running
+    # any main JavaScript. It then immediately pauses at the entry point. The
+    # old probe attempted Runtime.evaluate *before* this transition, which can
+    # sit unanswered and produce a misleading websocket timeout.
+    client.command("Runtime.runIfWaitingForDebugger", timeout=min(10.0, timeout))
+    return client.wait_for_event("Debugger.paused", timeout=min(15.0, timeout))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--requested", required=True)
-    parser.add_argument("--timeout", type=float, default=25.0)
+    parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args()
 
+    print(f"Waiting for Electron main inspector on 127.0.0.1:{args.port} ...")
     try:
-        target = wait_for_inspector_target(args.port, min(args.timeout, 12.0))
+        target = wait_for_inspector_target(args.port, args.timeout)
     except Exception as exc:
         print(f"EARLY_BOOTSTRAP_UNAVAILABLE: {exc}", file=sys.stderr)
         return 4
+
+    print("Electron main inspector is reachable.")
 
     client: InspectorClient | None = None
     resumed = False
     try:
         client = InspectorClient.connect(target["webSocketDebuggerUrl"])
-        try:
-            client.command("Runtime.enable")
-        except Exception:
-            pass
-        try:
-            client.command("Debugger.enable")
-        except Exception:
-            pass
+        print("Debugger connected. Advancing to the --inspect-brk startup pause ...")
+        paused = enter_inspect_brk_pause(client, args.timeout)
+        reason = (paused.get("params") or {}).get("reason")
+        print(f"Electron main JavaScript is paused before normal startup (reason: {reason or 'unknown'}).")
+        print("Installing renderer timezone override while startup is paused ...")
 
-        installed = client.evaluate(make_bootstrap_expression(args.requested), timeout=10.0)
+        installed = client.evaluate(make_bootstrap_expression(args.requested), timeout=15.0)
         if not isinstance(installed, dict) or not installed.get("ok"):
             raise RuntimeError(f"unexpected bootstrap result: {installed!r}")
 
         print("Early Electron bootstrap installed before normal app startup.")
         print(f"Requested timezone: {args.requested}")
+        print("Resuming Codex startup ...")
 
-        resume_application(client)
+        client.command("Debugger.resume", timeout=8.0)
         resumed = True
 
         requested_norm = normalize_zone(args.requested)
@@ -315,8 +384,6 @@ def main() -> int:
     finally:
         if client is not None:
             if not resumed:
-                # Never intentionally leave Codex suspended merely because our
-                # diagnostic injection failed after attaching to the inspector.
                 resume_application(client)
             client.close()
 
