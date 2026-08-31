@@ -1,0 +1,94 @@
+name: Native timezone shim probe
+
+on:
+  push:
+    branches: [phase0-timezone-probe]
+    paths:
+      - 'native-probe/**'
+      - '.github/workflows/native-probe.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'native-probe/**'
+      - '.github/workflows/native-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch Microsoft Detours
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/Detours.git "$env:RUNNER_TEMP\detours"
+
+      - name: Build Microsoft Detours x64
+        shell: cmd
+        run: |
+          cd /d "%RUNNER_TEMP%\detours\src"
+          nmake
+
+      - name: Build native timezone probe
+        shell: cmd
+        run: |
+          if not exist out mkdir out
+          cl /nologo /std:c++20 /EHsc /MD /LD native-probe\tzshim.cpp native-probe\tzshim.def /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\CodexTzShim64.dll /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD native-probe\tzshim-launcher.cpp /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\tzshim-launcher.exe /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD native-probe\tzdiag.cpp /link /OUT:out\tzdiag.exe windowsapp.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Show baseline Windows timezone APIs
+        shell: pwsh
+        run: .\out\tzdiag.exe
+
+      - name: Test process-local Hawaiian timezone override
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'tzshim.log'
+          $output = & .\out\tzshim-launcher.exe `
+            --timezone-windows-id 'Hawaiian Standard Time' `
+            --log $log `
+            --wait `
+            -- .\out\tzdiag.exe 2>&1 | Out-String
+          Write-Host $output
+          if (Test-Path $log) {
+            Write-Host '--- shim log ---'
+            Get-Content $log
+          }
+          if ($LASTEXITCODE -ne 0) {
+            throw "tzdiag exited with $LASTEXITCODE"
+          }
+          if ($output -notmatch 'win32\.key=Hawaiian Standard Time') {
+            throw 'GetDynamicTimeZoneInformation did not observe the process-local override.'
+          }
+          if ($output -notmatch 'win32\.year_bias=600') {
+            throw 'GetTimeZoneInformationForYear did not observe Hawaii UTC-10 rules.'
+          }
+          if ($output -notmatch 'winrt\.iana=Pacific/Honolulu') {
+            throw 'Windows.Globalization.Calendar did not observe Pacific/Honolulu. Native Codex IANA discovery would still require another mechanism.'
+          }
+
+      - name: Package native probe
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE out\LICENSE
+          Compress-Archive -Path out\CodexTzShim64.dll,out\tzshim-launcher.exe,out\tzdiag.exe,out\LICENSE -DestinationPath out\native-timezone-probe-win-x64.zip
+
+      - name: Upload native probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-timezone-probe-win-x64
+          path: out/native-timezone-probe-win-x64.zip
+          if-no-files-found: error
