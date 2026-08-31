@@ -123,8 +123,18 @@ print(f"websocket-client: {version}")
 print(f"Bootstrap    : {bootstrap}")
 '@
 
-    $preflightOutput = @(& $PythonExecutable -c $checkScript $BootstrapPath 2>&1)
-    $preflightExitCode = $LASTEXITCODE
+    $oldErrorActionPreference = $ErrorActionPreference
+    try {
+        # Native-process stderr should be captured as ordinary preflight output;
+        # the actual pass/fail signal is the Python process exit code.
+        $ErrorActionPreference = "Continue"
+        $preflightOutput = @(& $PythonExecutable -c $checkScript $BootstrapPath 2>&1)
+        $preflightExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+
     foreach ($line in $preflightOutput) {
         Write-Host $line
     }
