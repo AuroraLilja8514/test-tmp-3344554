@@ -19,27 +19,38 @@ jobs:
       - name: Validate PowerShell syntax
         shell: pwsh
         run: |
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path '.\probe\launch-codex.ps1'),
-            [ref]$null,
-            [ref]$errors
-          )
-          if ($errors.Count -gt 0) {
-            $errors | Format-List | Out-String | Write-Error
-            exit 1
+          $failed = $false
+          Get-ChildItem .\probe\*.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              Write-Host "Syntax errors in $($_.Name)" -ForegroundColor Red
+              $errors | Format-List | Out-String | Write-Error
+              $failed = $true
+            }
           }
+          if ($failed) { exit 1 }
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Compile Python inspector
-        run: python -m py_compile probe/inspect-timezone.py
+      - name: Compile Python probes
+        run: python -m compileall -q probe
 
       - name: Install probe dependency
         run: python -m pip install -r requirements-probe.txt
 
-      - name: Check inspector CLI
-        run: python probe/inspect-timezone.py --help
+      - name: Check probe CLIs
+        shell: pwsh
+        run: |
+          python probe/inspect-timezone.py --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python probe/bootstrap-electron-timezone.py --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
