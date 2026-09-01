@@ -2,14 +2,20 @@ name: Native timezone shim probe
 
 on:
   push:
-    branches: [phase0-timezone-probe]
+    branches: [phase0-timezone-probe, phase0c-native-probe]
     paths:
       - 'native-probe/**'
+      - 'probe/launch-codex-phase0c.ps1'
+      - 'probe/inspect-codex-phase0c.ps1'
+      - 'PHASE0C.md'
       - '.github/workflows/native-probe.yml'
   pull_request:
     branches: [main]
     paths:
       - 'native-probe/**'
+      - 'probe/launch-codex-phase0c.ps1'
+      - 'probe/inspect-codex-phase0c.ps1'
+      - 'PHASE0C.md'
       - '.github/workflows/native-probe.yml'
 
 permissions:
@@ -44,31 +50,39 @@ jobs:
           if not exist out mkdir out
           cl /nologo /std:c++20 /EHsc /MD /LD native-probe\tzshim.cpp native-probe\tzshim.def /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\CodexTzShim64.dll /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib advapi32.lib
           if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD /LD native-probe\tzbroker.cpp native-probe\tzbroker.def /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\CodexTzBroker64.dll /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
+          if errorlevel 1 exit /b 1
           cl /nologo /std:c++20 /EHsc /MD native-probe\tzshim-launcher.cpp /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\tzshim-launcher.exe /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
           if errorlevel 1 exit /b 1
           cl /nologo /std:c++20 /EHsc /MD native-probe\tzdiag.cpp /link /OUT:out\tzdiag.exe windowsapp.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD native-probe\tzdiag.cpp /link /OUT:out\codex.exe windowsapp.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD native-probe\brokerhost.cpp /link /OUT:out\ChatGPT.exe
           if errorlevel 1 exit /b 1
 
       - name: Show baseline Windows timezone APIs
         shell: pwsh
         run: .\out\tzdiag.exe
 
-      - name: Test process-local Hawaiian timezone override
+      - name: Test direct process-local Hawaiian timezone override
         shell: pwsh
         run: |
-          $log = Join-Path $env:RUNNER_TEMP 'tzshim.log'
+          $log = Join-Path $env:RUNNER_TEMP 'tzshim-direct.log'
           $output = & .\out\tzshim-launcher.exe `
             --timezone-windows-id 'Hawaiian Standard Time' `
+            --timezone-iana 'Pacific/Honolulu' `
             --log $log `
             --wait `
             -- .\out\tzdiag.exe 2>&1 | Out-String
           Write-Host $output
-          if (Test-Path $log) {
-            Write-Host '--- shim log ---'
-            Get-Content $log
-          }
+          Write-Host '--- shim log ---'
+          Get-Content $log
           if ($LASTEXITCODE -ne 0) {
             throw "tzdiag exited with $LASTEXITCODE"
+          }
+          if ($output -notmatch 'env\.tz=Pacific/Honolulu') {
+            throw 'The child-only IANA TZ environment was not inherited.'
           }
           if ($output -notmatch 'win32\.key=Hawaiian Standard Time') {
             throw 'GetDynamicTimeZoneInformation did not observe the process-local override.'
@@ -77,18 +91,83 @@ jobs:
             throw 'GetTimeZoneInformationForYear did not observe Hawaii UTC-10 rules.'
           }
           if ($output -notmatch 'winrt\.iana=Pacific/Honolulu') {
-            throw 'Windows.Globalization.Calendar did not observe Pacific/Honolulu. Native Codex IANA discovery would still require another mechanism.'
+            throw 'Windows.Globalization.Calendar did not observe Pacific/Honolulu.'
           }
 
-      - name: Package native probe
+      - name: Test selective ChatGPT broker to codex app-server injection
         shell: pwsh
         run: |
-          Copy-Item LICENSE out\LICENSE
-          Compress-Archive -Path out\CodexTzShim64.dll,out\tzshim-launcher.exe,out\tzdiag.exe,out\LICENSE -DestinationPath out\native-timezone-probe-win-x64.zip
+          $log = Join-Path $env:RUNNER_TEMP 'tzshim-broker.log'
+          $output = & .\out\tzshim-launcher.exe `
+            --timezone-windows-id 'Hawaiian Standard Time' `
+            --timezone-iana 'Pacific/Honolulu' `
+            --dll CodexTzBroker64.dll `
+            --log $log `
+            --wait `
+            -- .\out\ChatGPT.exe .\out\codex.exe 2>&1 | Out-String
+          Write-Host $output
+          Write-Host '--- shim log ---'
+          $logText = Get-Content $log | Out-String
+          Write-Host $logText
+          if ($LASTEXITCODE -ne 0) {
+            throw "broker diagnostic exited with $LASTEXITCODE"
+          }
+          if ($logText -notmatch 'exe=.*ChatGPT\.exe.*role=broker loaded timezone-shim=') {
+            throw 'The ChatGPT test host did not enter broker-only mode.'
+          }
+          if ($logText -notmatch 'role=broker match=codex-app-server') {
+            throw 'The broker did not recognize the codex.exe app-server command.'
+          }
+          if ($logText -notmatch 'role=broker injection=success') {
+            throw 'The broker did not inject the native timezone shim into codex.exe.'
+          }
+          if ($logText -notmatch 'exe=.*codex\.exe.*target=loaded.*windows-id=') {
+            throw 'The codex.exe child did not enter native-timezone mode.'
+          }
+          if ($output -notmatch 'winrt\.iana=Pacific/Honolulu') {
+            throw 'The selectively injected codex.exe child did not observe Pacific/Honolulu.'
+          }
 
-      - name: Upload native probe artifact
+      - name: Validate Phase 0C PowerShell syntax
+        shell: pwsh
+        run: |
+          $failed = $false
+          @(
+            '.\probe\launch-codex-phase0c.ps1',
+            '.\probe\inspect-codex-phase0c.ps1'
+          ) | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $_),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-String | Write-Error
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Package Phase 0C native probe
+        shell: pwsh
+        run: |
+          $stage = 'out\package'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item out\CodexTzShim64.dll $stage
+          Copy-Item out\CodexTzBroker64.dll $stage
+          Copy-Item out\tzshim-launcher.exe $stage
+          Copy-Item out\tzdiag.exe $stage
+          Copy-Item probe\launch-codex-phase0c.ps1 $stage
+          Copy-Item probe\inspect-codex-phase0c.ps1 $stage
+          Copy-Item PHASE0C.md $stage
+          Copy-Item LICENSE $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath out\phase0c-native-probe-win-x64.zip
+
+      - name: Upload Phase 0C native probe artifact
         uses: actions/upload-artifact@v4
         with:
-          name: native-timezone-probe-win-x64
-          path: out/native-timezone-probe-win-x64.zip
+          name: phase0c-native-probe-win-x64
+          path: out/phase0c-native-probe-win-x64.zip
           if-no-files-found: error
