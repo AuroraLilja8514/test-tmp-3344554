@@ -60,14 +60,17 @@ std::string WideToAnsi(const std::wstring& value) {
 
 void PrintUsage() {
     std::wcerr << L"Usage: tzshim-launcher.exe --timezone-windows-id <Windows ID> "
-                  L"[--log <path>] [--wait] -- <exe> [args...]\n";
+                  L"[--timezone-iana <IANA ID>] [--dll <DLL path/name>] [--log <path>] "
+                  L"[--wait] -- <exe> [args...]\n";
 }
 
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
     std::wstring windows_id;
+    std::wstring iana_id;
     std::wstring log_path;
+    std::wstring dll_name = L"CodexTzShim64.dll";
     bool wait_for_exit = false;
     int separator = -1;
 
@@ -79,6 +82,14 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (arg == L"--timezone-windows-id" && i + 1 < argc) {
             windows_id = argv[++i];
+            continue;
+        }
+        if (arg == L"--timezone-iana" && i + 1 < argc) {
+            iana_id = argv[++i];
+            continue;
+        }
+        if (arg == L"--dll" && i + 1 < argc) {
+            dll_name = argv[++i];
             continue;
         }
         if (arg == L"--log" && i + 1 < argc) {
@@ -103,7 +114,10 @@ int wmain(int argc, wchar_t** argv) {
         std::wcerr << L"Unable to determine launcher path. Error " << GetLastError() << L"\n";
         return 3;
     }
-    const auto shim_path = std::filesystem::path(own_path).parent_path() / L"CodexTzShim64.dll";
+    const std::filesystem::path requested_dll(dll_name);
+    const auto shim_path = requested_dll.is_absolute()
+                               ? requested_dll
+                               : std::filesystem::path(own_path).parent_path() / requested_dll;
     if (!std::filesystem::exists(shim_path)) {
         std::wcerr << L"Timezone shim DLL not found: " << shim_path.c_str() << L"\n";
         return 3;
@@ -115,7 +129,13 @@ int wmain(int argc, wchar_t** argv) {
         return 3;
     }
 
+    // These variables are set only in this launcher process. The target inherits
+    // them, while the parent shell and Windows user/system environment remain unchanged.
     SetEnvironmentVariableW(L"CODEX_TZ_WINDOWS_ID", windows_id.c_str());
+    if (!iana_id.empty()) {
+        SetEnvironmentVariableW(L"CODEX_TZ_IANA", iana_id.c_str());
+        SetEnvironmentVariableW(L"TZ", iana_id.c_str());
+    }
     if (!log_path.empty()) {
         SetEnvironmentVariableW(L"CODEX_TZ_SHIM_LOG", log_path.c_str());
     }
@@ -151,7 +171,11 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     std::wcout << L"Started PID " << process.dwProcessId << L" with process-local Windows timezone ID '"
-               << windows_id << L"'.\n";
+               << windows_id << L"'";
+    if (!iana_id.empty()) {
+        std::wcout << L" and IANA ID '" << iana_id << L"'";
+    }
+    std::wcout << L".\n";
     CloseHandle(process.hThread);
 
     int exit_code = 0;

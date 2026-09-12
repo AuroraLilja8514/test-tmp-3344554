@@ -5,6 +5,20 @@
 #include <iostream>
 #include <string>
 
+namespace {
+
+std::wstring ReadEnvironment(const wchar_t* name) {
+    const DWORD required = GetEnvironmentVariableW(name, nullptr, 0);
+    if (required == 0) return {};
+    std::wstring value(required, L'\0');
+    const DWORD written = GetEnvironmentVariableW(name, value.data(), required);
+    if (written == 0 || written >= required) return {};
+    value.resize(written);
+    return value;
+}
+
+}  // namespace
+
 int wmain() {
     DYNAMIC_TIME_ZONE_INFORMATION dynamic_info{};
     const DWORD state = GetDynamicTimeZoneInformation(&dynamic_info);
@@ -15,6 +29,8 @@ int wmain() {
     SYSTEMTIME local{};
     GetLocalTime(&local);
 
+    std::wcout << L"env.tz=" << ReadEnvironment(L"TZ") << L"\n";
+    std::wcout << L"env.iana=" << ReadEnvironment(L"CODEX_TZ_IANA") << L"\n";
     std::wcout << L"win32.key=" << dynamic_info.TimeZoneKeyName << L"\n";
     std::wcout << L"win32.state=" << state << L"\n";
     std::wcout << L"win32.bias=" << dynamic_info.Bias << L"\n";

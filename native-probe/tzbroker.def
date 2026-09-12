@@ -1,0 +1,3 @@
+LIBRARY "CodexTzBroker"
+EXPORTS
+    DetourFinishHelperProcess @1
