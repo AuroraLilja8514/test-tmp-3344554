@@ -154,29 +154,37 @@ try {
     Write-Host ""
     Write-Host "Launching Codex with the selective native broker..."
 
-    $launchOutput = @(& $launcher `
+    # Do not capture the native launcher's stdout/stderr into a PowerShell pipeline.
+    # tzshim-launcher intentionally allows the GUI target to inherit handles. If
+    # PowerShell redirects the launcher into a capture pipe, ChatGPT.exe can keep
+    # the pipe's write handle alive for its entire lifetime, so PowerShell never
+    # observes EOF even though tzshim-launcher.exe has already exited.
+    & $launcher `
         --timezone-windows-id $windowsId `
         --timezone-iana $TimeZone `
         --dll CodexTzBroker64.dll `
         --log $logPath `
-        -- $codexExe 2>&1)
+        -- $codexExe
     $launchExitCode = $LASTEXITCODE
-    foreach ($line in $launchOutput) {
-        Write-Host $line
-    }
     if ($launchExitCode -ne 0) {
         throw "Native launcher failed with exit code $launchExitCode. Codex was not successfully started."
     }
 
+    # The preflight above guarantees there was no matching package process before
+    # launch, so any matching process now belongs to this run. Avoid depending on
+    # captured launcher text to recover the PID.
     $rootPid = 0
-    foreach ($line in $launchOutput) {
-        if ([string]$line -match "Started PID\s+(\d+)") {
-            $rootPid = [int]$Matches[1]
+    $pidDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $pidDeadline -and $rootPid -eq 0) {
+        $started = @(Get-RunningCodexProcesses -ExecutablePath $codexExe)
+        if ($started.Count -gt 0) {
+            $rootPid = [int]($started | Sort-Object CreationDate -Descending | Select-Object -First 1).ProcessId
             break
         }
+        Start-Sleep -Milliseconds 100
     }
     if ($rootPid -eq 0) {
-        Write-Warning "Could not parse the ChatGPT.exe PID from launcher output. The log can still be inspected."
+        Write-Warning "Could not resolve the ChatGPT.exe PID after launch. The log can still be inspected."
     }
 
     $state = [ordered]@{
