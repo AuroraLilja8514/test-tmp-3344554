@@ -2,7 +2,6 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Authentication;
 using System.Text;
 using CodexTimeZoneLauncher.Models;
 
@@ -62,29 +61,31 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
 
     private async Task HandleClientSafelyAsync(TcpClient client, CancellationToken cancellationToken)
     {
-        await using var _ = client.ConfigureAwait(false);
-        try
+        using (client)
         {
-            using var stream = client.GetStream();
-            var request = await ReadHeaderAsync(stream, cancellationToken);
-            var parsed = ParseRequest(request.Header);
+            try
+            {
+                using var stream = client.GetStream();
+                var request = await ReadHeaderAsync(stream, cancellationToken);
+                var parsed = ParseRequest(request.Header);
 
-            if (parsed.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
-            {
-                var (host, port) = ParseAuthority(parsed.Target, 443);
-                await HandleConnectAsync(stream, request.Extra, host, port, cancellationToken);
+                if (parsed.Method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
+                {
+                    var (host, port) = ParseAuthority(parsed.Target, 443);
+                    await HandleConnectAsync(stream, request.Extra, host, port, cancellationToken);
+                }
+                else
+                {
+                    await HandlePlainHttpAsync(stream, request.Extra, parsed, cancellationToken);
+                }
             }
-            else
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                await HandlePlainHttpAsync(stream, request.Extra, parsed, cancellationToken);
             }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            _log($"Proxy connection failed: {ex.Message}");
+            catch (Exception ex)
+            {
+                _log($"Proxy connection failed: {ex.Message}");
+            }
         }
     }
 
@@ -99,9 +100,9 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         await WriteAsciiAsync(client, "HTTP/1.1 200 Connection Established\r\nProxy-Agent: CodexTimeZoneLauncher\r\n\r\n", cancellationToken);
 
         if (outbound.InitialRead.Length > 0)
-            await client.WriteAsync(outbound.InitialRead, cancellationToken);
+            await client.WriteAsync(outbound.InitialRead.AsMemory(), cancellationToken);
         if (clientExtra.Length > 0)
-            await outbound.Stream.WriteAsync(clientExtra, cancellationToken);
+            await outbound.Stream.WriteAsync(clientExtra.AsMemory(), cancellationToken);
 
         await RelayBothWaysAsync(client, outbound.Stream, cancellationToken);
     }
@@ -122,17 +123,17 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         {
             await using var proxy = await OpenProxyTransportAsync(cancellationToken);
             var header = BuildForwardHeader(request, absoluteTarget, includeProxyAuthorization: true);
-            await proxy.Stream.WriteAsync(header, cancellationToken);
-            if (clientExtra.Length > 0) await proxy.Stream.WriteAsync(clientExtra, cancellationToken);
+            await proxy.Stream.WriteAsync(header.AsMemory(), cancellationToken);
+            if (clientExtra.Length > 0) await proxy.Stream.WriteAsync(clientExtra.AsMemory(), cancellationToken);
             await RelayBothWaysAsync(client, proxy.Stream, cancellationToken);
             return;
         }
 
         await using var outbound = await OpenTunnelAsync(host, port, cancellationToken);
         var directHeader = BuildForwardHeader(request, originTarget, includeProxyAuthorization: false);
-        await outbound.Stream.WriteAsync(directHeader, cancellationToken);
-        if (clientExtra.Length > 0) await outbound.Stream.WriteAsync(clientExtra, cancellationToken);
-        if (outbound.InitialRead.Length > 0) await client.WriteAsync(outbound.InitialRead, cancellationToken);
+        await outbound.Stream.WriteAsync(directHeader.AsMemory(), cancellationToken);
+        if (clientExtra.Length > 0) await outbound.Stream.WriteAsync(clientExtra.AsMemory(), cancellationToken);
+        if (outbound.InitialRead.Length > 0) await client.WriteAsync(outbound.InitialRead.AsMemory(), cancellationToken);
         await RelayBothWaysAsync(client, outbound.Stream, cancellationToken);
     }
 
@@ -153,7 +154,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         try
         {
             await tcp.ConnectAsync(host, port, cancellationToken);
-            return new OutboundConnection(tcp.GetStream(), Array.Empty<byte>());
+            return new OutboundConnection(tcp, tcp.GetStream());
         }
         catch
         {
@@ -182,15 +183,17 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
             if (parts.Length < 2 || !int.TryParse(parts[1], out var status) || status is < 200 or >= 300)
                 throw new IOException($"Upstream HTTP proxy CONNECT failed: {statusLine}");
 
-            return new OutboundConnection(proxy.DetachStream(), response.Extra);
+            proxy.InitialRead = response.Extra;
+            return proxy;
         }
-        finally
+        catch
         {
-            await proxy.DisposeIfAttachedAsync();
+            await proxy.DisposeAsync();
+            throw;
         }
     }
 
-    private async Task<DetachableConnection> OpenProxyTransportAsync(CancellationToken cancellationToken)
+    private async Task<OutboundConnection> OpenProxyTransportAsync(CancellationToken cancellationToken)
     {
         var tcp = new TcpClient();
         try
@@ -203,11 +206,10 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
                 await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                 {
                     TargetHost = _upstream.Host,
-                    EnabledSslProtocols = SslProtocols.None,
                 }, cancellationToken);
                 stream = ssl;
             }
-            return new DetachableConnection(stream, tcp);
+            return new OutboundConnection(tcp, stream);
         }
         catch
         {
@@ -227,7 +229,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
             var greeting = hasCredentials
                 ? new byte[] { 0x05, 0x02, 0x00, 0x02 }
                 : new byte[] { 0x05, 0x01, 0x00 };
-            await stream.WriteAsync(greeting, cancellationToken);
+            await stream.WriteAsync(greeting.AsMemory(), cancellationToken);
 
             var method = new byte[2];
             await ReadExactlyAsync(stream, method, cancellationToken);
@@ -244,7 +246,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
             request[1] = 0x01;
             request[2] = 0x00;
             destination.CopyTo(request, 3);
-            await stream.WriteAsync(request, cancellationToken);
+            await stream.WriteAsync(request.AsMemory(), cancellationToken);
 
             var reply = new byte[4];
             await ReadExactlyAsync(stream, reply, cancellationToken);
@@ -254,7 +256,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
             var boundPort = new byte[2];
             await ReadExactlyAsync(stream, boundPort, cancellationToken);
 
-            return new OutboundConnection(stream, Array.Empty<byte>());
+            return new OutboundConnection(tcp, stream);
         }
         catch
         {
@@ -273,7 +275,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         user.CopyTo(auth, 2);
         auth[2 + user.Length] = (byte)pass.Length;
         pass.CopyTo(auth, 3 + user.Length);
-        await stream.WriteAsync(auth, cancellationToken);
+        await stream.WriteAsync(auth.AsMemory(), cancellationToken);
 
         var reply = new byte[2];
         await ReadExactlyAsync(stream, reply, cancellationToken);
@@ -390,14 +392,24 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
             return true;
         }
 
-        var hostHeader = request.HeaderLines
-            .Select(line => line.Split(':', 2))
-            .FirstOrDefault(parts => parts.Length == 2 && parts[0].Trim().Equals("Host", StringComparison.OrdinalIgnoreCase));
-        if (hostHeader is null) return false;
-        (host, port) = ParseAuthority(hostHeader[1].Trim(), 80);
+        var hostHeader = GetHeaderValue(request.HeaderLines, "Host");
+        if (string.IsNullOrWhiteSpace(hostHeader)) return false;
+        (host, port) = ParseAuthority(hostHeader, 80);
         originTarget = request.Target.StartsWith('/') ? request.Target : "/" + request.Target;
         absoluteTarget = $"http://{FormatAuthority(host, port)}{originTarget}";
         return true;
+    }
+
+    private static string? GetHeaderValue(IEnumerable<string> lines, string name)
+    {
+        foreach (var line in lines)
+        {
+            var colon = line.IndexOf(':');
+            if (colon <= 0) continue;
+            if (line[..colon].Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
+                return line[(colon + 1)..].Trim();
+        }
+        return null;
     }
 
     private static ParsedRequest ParseRequest(byte[] headerBytes)
@@ -431,6 +443,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
                 throw new IOException("Malformed proxy authority port.");
             return (authority[..colon], ValidatePort(parsedPort));
         }
+        if (string.IsNullOrWhiteSpace(authority)) throw new IOException("Proxy target host is empty.");
         return (authority, defaultPort);
     }
 
@@ -439,7 +452,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         : throw new IOException("Proxy target port is outside 1-65535.");
 
     private static string FormatAuthority(string host, int port)
-        => host.Contains(':', StringComparison.Ordinal) ? $"[{host}]:{port}" : $"{host}:{port}";
+        => host.Contains(':') ? $"[{host}]:{port}" : $"{host}:{port}";
 
     private static async Task<(byte[] Header, byte[] Extra)> ReadHeaderAsync(Stream stream, CancellationToken cancellationToken)
     {
@@ -447,7 +460,7 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         var buffer = new byte[4096];
         while (data.Length <= MaxHeaderBytes)
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken);
+            var read = await stream.ReadAsync(buffer.AsMemory(), cancellationToken);
             if (read == 0) throw new EndOfStreamException("Connection closed before an HTTP header was complete.");
             data.Write(buffer, 0, read);
             var bytes = data.ToArray();
@@ -482,8 +495,11 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
         }
     }
 
-    private static Task WriteAsciiAsync(Stream stream, string text, CancellationToken cancellationToken)
-        => stream.WriteAsync(Encoding.ASCII.GetBytes(text), cancellationToken).AsTask();
+    private static async Task WriteAsciiAsync(Stream stream, string text, CancellationToken cancellationToken)
+    {
+        var bytes = Encoding.ASCII.GetBytes(text);
+        await stream.WriteAsync(bytes.AsMemory(), cancellationToken);
+    }
 
     private static async Task RelayBothWaysAsync(Stream left, Stream right, CancellationToken cancellationToken)
     {
@@ -522,42 +538,20 @@ public sealed class LoopbackProxyAdapter : IAsyncDisposable
 
     private sealed class OutboundConnection : IAsyncDisposable
     {
-        public OutboundConnection(Stream stream, byte[] initialRead)
-        {
-            Stream = stream;
-            InitialRead = initialRead;
-        }
-        public Stream Stream { get; }
-        public byte[] InitialRead { get; }
-        public ValueTask DisposeAsync() => Stream.DisposeAsync();
-    }
+        private readonly TcpClient _client;
 
-    private sealed class DetachableConnection : IAsyncDisposable
-    {
-        private Stream? _stream;
-        private readonly TcpClient _tcp;
-        public DetachableConnection(Stream stream, TcpClient tcp)
+        public OutboundConnection(TcpClient client, Stream stream)
         {
-            _stream = stream;
-            _tcp = tcp;
+            _client = client;
+            Stream = stream;
         }
-        public Stream Stream => _stream ?? throw new ObjectDisposedException(nameof(DetachableConnection));
-        public Stream DetachStream()
-        {
-            var value = _stream ?? throw new ObjectDisposedException(nameof(DetachableConnection));
-            _stream = null;
-            return value;
-        }
-        public async ValueTask DisposeIfAttachedAsync()
-        {
-            if (_stream is not null) await _stream.DisposeAsync();
-            if (_stream is not null) _tcp.Dispose();
-        }
+
+        public Stream Stream { get; }
+        public byte[] InitialRead { get; set; } = Array.Empty<byte>();
+
         public async ValueTask DisposeAsync()
         {
-            if (_stream is not null) await _stream.DisposeAsync();
-            _tcp.Dispose();
-            _stream = null;
+            try { await Stream.DisposeAsync(); } finally { _client.Dispose(); }
         }
     }
 }
