@@ -5,12 +5,14 @@ on:
     branches: [phase1-production-launcher]
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'native-probe/**'
       - '.github/workflows/production-ci.yml'
       - 'LICENSE'
   pull_request:
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'native-probe/**'
       - '.github/workflows/production-ci.yml'
       - 'LICENSE'
@@ -58,6 +60,10 @@ jobs:
         shell: pwsh
         run: dotnet build .\src\CodexTimeZoneLauncher\CodexTimeZoneLauncher.csproj -c Release
 
+      - name: Smoke test loopback proxy
+        shell: pwsh
+        run: dotnet run --project .\tests\ProxySmokeTest\ProxySmokeTest.csproj -c Release
+
       - name: Publish self-contained launcher
         shell: pwsh
         run: |
@@ -89,8 +95,9 @@ jobs:
           $notes = @"
           Automated Phase 1 preview build from commit $env:GITHUB_SHA.
 
-          Includes the .NET 10 WinForms launcher and the native timezone broker/shim helpers.
-          This is a test build: proxy routing and true single-EXE helper embedding are not finished yet.
+          Includes the .NET 10 WinForms launcher, native timezone broker/shim helpers, and process-scoped proxy routing through HTTP, HTTPS, SOCKS5, or SOCKS5h upstreams.
+          Proxy credentials remain inside the launcher and are not persisted; Windows system proxy settings are not modified.
+          This is still a test build: true single-EXE native-helper embedding and non-zero fixed-offset timezone synthesis are not finished yet.
           "@
           gh release create $tag `
             .\out\codex-timezone-launcher-win-x64.zip `
