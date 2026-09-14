@@ -1,0 +1,76 @@
+name: Production launcher CI
+
+on:
+  push:
+    branches: [phase1-production-launcher]
+    paths:
+      - 'src/**'
+      - 'native-probe/**'
+      - '.github/workflows/production-ci.yml'
+      - 'LICENSE'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'native-probe/**'
+      - '.github/workflows/production-ci.yml'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+
+jobs:
+  build-win-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch and build Microsoft Detours
+        shell: cmd
+        run: |
+          git clone --depth 1 https://github.com/microsoft/Detours.git "%RUNNER_TEMP%\detours"
+          cd /d "%RUNNER_TEMP%\detours\src"
+          nmake
+          if errorlevel 1 exit /b 1
+
+      - name: Build native helpers
+        shell: cmd
+        run: |
+          if not exist out\native mkdir out\native
+          cl /nologo /std:c++20 /EHsc /MD /LD native-probe\tzshim.cpp native-probe\tzshim.def /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\native\CodexTzShim64.dll /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib advapi32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD /LD native-probe\tzbroker.cpp native-probe\tzbroker.def /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\native\CodexTzBroker64.dll /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++20 /EHsc /MD native-probe\tzshim-launcher.cpp /I"%RUNNER_TEMP%\detours\src" /link /OUT:out\native\tzshim-launcher.exe /LIBPATH:"%RUNNER_TEMP%\detours\lib.X64" detours.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Build launcher
+        shell: pwsh
+        run: dotnet build .\src\CodexTimeZoneLauncher\CodexTimeZoneLauncher.csproj -c Release
+
+      - name: Publish self-contained launcher
+        shell: pwsh
+        run: |
+          dotnet publish .\src\CodexTimeZoneLauncher\CodexTimeZoneLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o .\out\publish
+          Copy-Item .\out\native\CodexTzShim64.dll .\out\publish\
+          Copy-Item .\out\native\CodexTzBroker64.dll .\out\publish\
+          Copy-Item .\out\native\tzshim-launcher.exe .\out\publish\
+          Copy-Item .\LICENSE .\out\publish\LICENSE
+          Compress-Archive -Path .\out\publish\* -DestinationPath .\out\codex-timezone-launcher-win-x64.zip
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-timezone-launcher-win-x64
+          path: out/codex-timezone-launcher-win-x64.zip
+          if-no-files-found: error
