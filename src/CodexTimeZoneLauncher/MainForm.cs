@@ -125,7 +125,7 @@ public sealed class MainForm : Form
     private void AppendLogThreadSafe(string message)
     {
         if (IsDisposed) return;
-        if (InvokeRequired) BeginInvoke(() => AppendLog(message));
+        if (InvokeRequired) BeginInvoke(new Action(() => AppendLog(message)));
         else AppendLog(message);
     }
 
